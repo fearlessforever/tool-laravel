@@ -13,7 +13,7 @@ class DB_Import extends Command
      *
      * @var string
      */
-    protected $signature = 'db:import {table_name?*} {--all} {--exclude=} {--path=} {--ls-path}';
+    protected $signature = 'db:import {table_name?*} {--all-tables} {--exclude=} {--path=} {--ls-path} {--use-custom-import}';
 
     /**
      * The console command description.
@@ -47,11 +47,13 @@ class DB_Import extends Command
 
       $folderPath = storage_path('app/db');
       $certainPath = $this->option('path');
-      $isCertainPath = false;
-      if( !empty($certainPath) ){
-        $folderPath = storage_path("app/db/{$certainPath}");
-        $isCertainPath = true;
+      
+      if( empty($certainPath) ){
+        $this->warn('Folder name / path parameter is required');
+        return;
       }
+
+      $folderPath = storage_path("app/db/{$certainPath}");
       
       if( !File::exists( $folderPath ) ){
         $this->warn('Folder path is not found');
@@ -60,7 +62,7 @@ class DB_Import extends Command
       $tablesExclude=[];
       $fileExists = $this->__getFilesName( $folderPath ) ;
 
-      if($this->option('all')){
+      if($this->option('all-tables')){
         $tablesExclude = $this->__getExcludeTables();
 
         $tables = array_keys( $fileExists );
@@ -79,6 +81,15 @@ class DB_Import extends Command
       else
 
       {
+        $queryRelated = (object)['sqlString'=>'','pdoInstance'=>null , 'timeStart' => time() , 'timeEnd' => time() , 'timeCount' => 0 ,'customCallback'=>null , 'listCallback' => [] ];
+        $queryRelated->listCallback = config("fearlessforever.db_import.custom_import" , [] );
+        $queryRelated->listTableWithIdentityON = [];
+
+        if( env('DB_CONNECTION') == 'sqlsrv' ){
+          $queryRelated->listTableWithIdentityON = $this->__isMS_SQLgetTableWithIdentityON();
+          $queryRelated->listTableWithIdentityON = array_keys( $queryRelated->listTableWithIdentityON );
+        }
+        
         $tableDone =[];
         foreach($tables as $table)
         {
@@ -107,7 +118,7 @@ class DB_Import extends Command
           }
 
           $config = (object)[];
-          $config->ms_sql_exclude_tables_identity = config("fearlessforever.db_import.exclude_identity_set_on" , [] );
+          $config->ms_sql_tables_identity_on = $queryRelated->listTableWithIdentityON;
           $config->ms_sql_isIdentityOn = false;
           
           $importedCount=0;
@@ -118,10 +129,16 @@ class DB_Import extends Command
             $bar = $this->output->createProgressBar(100);
 
             $bar->start();
+
+            if( $this->option('use-custom-import') ){
+              $queryRelated->customCallback = $queryRelated->listCallback[$table] ?? null ;
+              $queryRelated->customCallback = is_callable($queryRelated->customCallback) ? $queryRelated->customCallback : null ;
+            }
+
             try{
               DB::beginTransaction();
 
-              if( !in_array( $table , $config->ms_sql_exclude_tables_identity ) ){
+              if( in_array( $table , $config->ms_sql_tables_identity_on ) ){
                 DB::unprepared("SET IDENTITY_INSERT {$table} ON");
                 $config->ms_sql_isIdentityOn = true ;
               }
@@ -131,7 +148,13 @@ class DB_Import extends Command
                   $line = fgets($handleFile);
 
                   $record = json_decode($line , TRUE);
+                  
                   if( $record ){
+
+                    if( $customCallback = $queryRelated->customCallback ){
+                      $record = $customCallback( $record );
+                    }
+
                     $query->insert($record);
                   }
                   $importedCount+=1;
@@ -175,7 +198,11 @@ class DB_Import extends Command
           );
         }
 
-        $this->info("Memory Usage: ". memory_get_usage());
+        $queryRelated->timeEnd = time();
+        $queryRelated->timeCount = $queryRelated->timeEnd - $queryRelated->timeStart;
+
+        $this->info('Done in '. $queryRelated->timeCount .' seconds , consumed memory: '. memory_get_usage() );
+
       }
 
       return 0;
@@ -231,6 +258,32 @@ class DB_Import extends Command
       }
 
       $this->table( array_keys($pathList[0]) , $pathList );
+    }
+
+    /**
+     * return array of [ table_name => column_name_with_identity_on ]
+    */
+    private function __isMS_SQLgetTableWithIdentityON() : array
+    {
+      $checkData = DB::select("
+      SELECT
+          A.name as column_name,
+          B.name as table_name ,
+          C.name as schema_name ,
+          A.is_identity
+      FROM sys.columns as A
+      INNER JOIN sys.tables as B ON B.object_id = A.object_id
+      INNER JOIN sys.schemas as C ON C.schema_id = B.schema_id
+          AND A.is_identity = 1
+      ");
+      
+      $data = [];
+
+      foreach($checkData as $val){
+        $data[ $val->schema_name != 'dbo' ? "{$val->schema_name}.{$val->table_name}" : $val->table_name  ] = $val->column_name ;
+      }
+      
+      return $data;
     }
 
 }

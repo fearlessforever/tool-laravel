@@ -14,7 +14,7 @@ class DB_Export extends Command
      *
      * @var string
      */
-    protected $signature = 'db:export {table_name?*} {--clear} {--tables-list-name=} {--all-tables} {--ultra-speed} {--force} {--with-time} {--sample-only=}';
+    protected $signature = 'db:export {table_name?*} {--clear} {--tables-list-group=} {--all-tables} {--ultra-speed} {--force} {--with-time} {--sample-only=} {--use-custom-export}';
 
     /**
      * The console command description.
@@ -40,9 +40,9 @@ class DB_Export extends Command
      */
     public function handle()
     {
-      if( $this->option('tables-list-name') ){
-        $tableListName = $this->option('tables-list-name');
-        $tables = config("fearlessforever.db_export.table_list_category.{$tableListName}" , [] );
+      if( $this->option('tables-list-group') ){
+        $tableListName = $this->option('tables-list-group');
+        $tables = config("fearlessforever.db_export.table_list_groups.{$tableListName}" , [] );
         
       }else if( $this->option('all-tables') ){
         $tables = $this->___getAllTables()->toArray();
@@ -104,6 +104,8 @@ class DB_Export extends Command
       $this->table(['Table Name'],$tableRows);
 
       $takeSampleDataOnly = (int) $this->option('sample-only');
+      $queryRelated = (object)['sqlString'=>'','pdoInstance'=>null , 'timeStart' => time() , 'timeEnd' => time() , 'timeCount' => 0 ,'customCallback'=>null , 'listCallback' => [] ];
+      $queryRelated->listCallback = config("fearlessforever.db_export.custom_export" , [] );
 
       foreach($tables as $table)
       {
@@ -115,7 +117,12 @@ class DB_Export extends Command
         }
         $tableDone[$table] = true;
 
-        $data = DB::table( $table )->get();
+        if( $this->option('use-custom-export') ){
+          $queryRelated->customCallback = $queryRelated->listCallback[$table] ?? null ;
+          $queryRelated->customCallback = is_callable($queryRelated->customCallback) ? $queryRelated->customCallback : null ;
+        }
+        
+        // $data = DB::table( $table )->get();
         $file_name = "{$table}.json";
 
         if( isset($fileExists[$file_name]) ){
@@ -126,8 +133,19 @@ class DB_Export extends Command
         }
 
         $countRowExported = 0;
-        
-        foreach($data as $row){
+
+        $queryRelated->pdoInstance = DB::connection()->getPdo();
+        $queryRelated->sqlString = DB::table( $table )->toSql(); // die(var_dump($queryRelated->sqlString));
+
+        $queryRelated->preparedStatement = $queryRelated->pdoInstance->prepare($queryRelated->sqlString);
+        $queryRelated->preparedStatement->execute();
+
+        while( $row = $queryRelated->preparedStatement->fetch( \PDO::FETCH_ASSOC ) ){
+
+          if( $customCallback = $queryRelated->customCallback ){
+            $row = $customCallback( $row );
+          }
+
           file_put_contents( "{$folderPath}/{$file_number}---{$file_name}" , json_encode($row) . PHP_EOL , FILE_APPEND );
 
           if( $takeSampleDataOnly > 0 && $countRowExported > $takeSampleDataOnly )break;
@@ -141,9 +159,12 @@ class DB_Export extends Command
 
       $bar->finish();
 
+      $queryRelated->timeEnd = time();
+      $queryRelated->timeCount = $queryRelated->timeEnd - $queryRelated->timeStart;
+
       $this->newLine(2);
       $this->info('Save into : '. $folderPath );
-      $this->info('Done '. memory_get_usage() );
+      $this->info('Done in '. $queryRelated->timeCount .' seconds , consumed memory: '. memory_get_usage() );
       $this->newLine();
 
       return 0;
@@ -202,12 +223,38 @@ class DB_Export extends Command
         order by level;
         
         START;
+      
+      if( env('DB_CONNECTION') == 'sqlsrv' ){
+        $queryGetTables = 
+        <<<START
+          WITH cte (lvl, object_id, name, schema_Name) AS
+            (SELECT 1, object_id, sys.tables.name, sys.schemas.name as schema_Name
+            FROM sys.tables Inner Join sys.schemas on sys.tables.schema_id = sys.schemas.schema_id
+            WHERE type_desc = 'USER_TABLE'
+              AND is_ms_shipped = 0
+            UNION ALL SELECT cte.lvl + 1, t.object_id, t.name, S.name as schema_Name
+            FROM cte
+            JOIN sys.tables AS t ON EXISTS
+              (SELECT NULL FROM sys.foreign_keys AS fk
+                WHERE fk.parent_object_id = t.object_id
+                  AND fk.referenced_object_id = cte.object_id )
+            JOIN sys.schemas as S on t.schema_id = S.schema_id
+            AND t.object_id <> cte.object_id
+            AND cte.lvl < 30
+            WHERE t.type_desc = 'USER_TABLE'
+              AND t.is_ms_shipped = 0 )
+          SELECT schema_name, name as table_name, MAX (lvl) AS dependency_level
+          FROM cte
+          GROUP BY schema_Name, name
+          ORDER BY dependency_level,schema_Name, name;
+        START;
+      }
 
       $check = DB::select( $queryGetTables , $schemas );
             // file_put_contents('test.json' , json_encode($check, JSON_PRETTY_PRINT));
       $tables = collect($check);
       $data = $tables->map( fn($val) => (array)$val );
-      $tableName = $tables->map( fn($val) => $val->schema_name == 'public' ? $val->table_name : "{$val->schema_name}.{$val->table_name}" );
+      $tableName = $tables->map( fn($val) => ($val->schema_name == 'public' || $val->schema_name == 'dbo' ) ? $val->table_name : "{$val->schema_name}.{$val->table_name}" );
 
       $this->table( array_keys( (array)$check[0] ) , $data );
 
